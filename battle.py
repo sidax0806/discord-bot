@@ -10,6 +10,8 @@ TOKEN = os.getenv("TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID"))
 
 intents = discord.Intents.default()
+intents.dm_messages = True
+intents.guild_messages = True
 
 
 class BattleBot(commands.Bot):
@@ -20,8 +22,6 @@ class BattleBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        guild = discord.Object(id=GUILD_ID)
-
         # Cog読み込み（完成版）
         extensions = [
             "cogs.tournament",
@@ -37,7 +37,7 @@ class BattleBot(commands.Bot):
             print(f"{extension} を読み込みました")
 
         # スラッシュコマンド同期
-        synced = await self.tree.sync(guild=guild)
+        synced = await self.tree.sync()
         print(f"{len(synced)}個のコマンドを同期しました")
 
 
@@ -47,6 +47,14 @@ bot = BattleBot()
 @bot.event
 async def on_ready():
     print(f"{bot.user} がオンラインになりました！")
+
+
+@bot.event
+async def on_interaction(interaction):
+    if interaction.type.name != "application_command":
+        return
+    print(f"[Interaction] type={interaction.type} user={interaction.user} channel={getattr(interaction, 'channel', None)}")
+
 
 
 bot.run(TOKEN)
