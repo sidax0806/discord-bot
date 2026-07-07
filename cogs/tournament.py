@@ -5,10 +5,74 @@ from discord.ext import commands
 from discord import app_commands
 
 import data.tournament_data as tournament_data
+from cogs.match import send_round_notifications
 from utils.swiss import swiss_pairing
 
 
 GUILD_ID = 1238127187648057466
+
+
+async def safe_interaction_send(interaction: discord.Interaction, *, content=None, embed=None, view=None, ephemeral=False):
+    try:
+        if not interaction.response.is_done():
+            if view is None:
+                await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+            return
+
+        kwargs = {"content": content, "embed": embed, "ephemeral": ephemeral}
+        if view is not None:
+            kwargs["view"] = view
+        await interaction.followup.send(**kwargs)
+    except (discord.NotFound, discord.HTTPException):
+        if interaction.channel is not None:
+            try:
+                if view is None:
+                    await interaction.channel.send(content=content, embed=embed)
+                else:
+                    await interaction.channel.send(content=content, embed=embed, view=view)
+            except Exception:
+                pass
+
+
+async def safe_defer_interaction(interaction: discord.Interaction, *, ephemeral=False):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+            return True
+    except (discord.NotFound, discord.HTTPException):
+        return False
+    return True
+
+
+async def upsert_tournament_message(interaction: discord.Interaction, tournament: dict, embed: discord.Embed, view: discord.ui.View):
+    message_id = tournament.get("message_id")
+    channel = getattr(interaction, "channel", None)
+
+    if channel is not None and message_id is not None:
+        try:
+            msg = await channel.fetch_message(message_id)
+            await msg.edit(embed=embed, view=view)
+            tournament["message_id"] = msg.id
+            return msg
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    try:
+        if interaction.response.is_done():
+            msg = await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed, view=view)
+            msg = await interaction.original_response()
+    except (discord.NotFound, discord.HTTPException):
+        if channel is None:
+            raise
+        msg = await channel.send(embed=embed, view=view)
+
+    tournament["message_id"] = msg.id
+    tournament["channel_id"] = getattr(channel, "id", None)
+    return msg
 
 
 # ==========================
@@ -73,7 +137,7 @@ async def disable_buttons(interaction: discord.Interaction):
 async def end_tournament_internal(interaction: discord.Interaction):
     t = tournament_data.current_tournament
     if t is None:
-        await interaction.followup.send("❌ 大会がありません。")
+        await safe_interaction_send(interaction, content="❌ 大会がありません。")
         return
 
     embed = discord.Embed(
@@ -82,7 +146,7 @@ async def end_tournament_internal(interaction: discord.Interaction):
         color=discord.Color.red()
     )
 
-    await interaction.followup.send(embed=embed)
+    await safe_interaction_send(interaction, embed=embed)
     tournament_data.reset()
 
 
@@ -101,6 +165,7 @@ def is_round_robin_finished(t):
 # 自動ラウンド移行
 # ==========================
 async def auto_next_round(interaction: discord.Interaction):
+    print("[Tournament] auto_next_round called")
     t = tournament_data.current_tournament
     if t is None:
         return
@@ -150,6 +215,7 @@ async def auto_next_round(interaction: discord.Interaction):
     if bye_player:
         await interaction.followup.send(f"BYE: {bye_player['name']}（勝点 +3）")
 
+    await send_round_notifications(interaction, round_num, matches, bye_player)
     await send_ranking_summary(interaction)
 
 
@@ -157,15 +223,22 @@ async def auto_next_round(interaction: discord.Interaction):
 # 大会開始処理
 # ==========================
 async def start_tournament_internal(interaction: discord.Interaction):
+    print("[Tournament] start_tournament_internal called")
     t = tournament_data.current_tournament
     if t is None:
+        print("[Tournament] no current tournament")
         await interaction.followup.send("❌ 大会がありません。")
         return
 
-    participants = t["participants"]
+    participants = t.get("participants", [])
+    if not isinstance(participants, list):
+        participants = list(participants or [])
 
-    if len(participants) < 2:
-        await interaction.followup.send("❌ 2人以上必要です。")
+    print(f"[Tournament] starting tournament with {len(participants)} participants")
+    print(f"[Tournament] participant data: {participants}")
+
+    if len(participants) < 1:
+        await interaction.followup.send("❌ 参加者がいません。")
         return
 
     for p in participants:
@@ -213,6 +286,7 @@ async def start_tournament_internal(interaction: discord.Interaction):
     if bye_players:
         await interaction.followup.send(f"BYE: {bye_players[0]['name']}（勝点 +3）")
 
+    await send_round_notifications(interaction, 1, matches, bye_players[0] if bye_players else None)
     await send_ranking_summary(interaction)
 
 
@@ -253,8 +327,9 @@ class ResultButtonView(discord.ui.View):
 
     @discord.ui.button(label="結果入力", style=discord.ButtonStyle.green)
     async def result_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         modal = ResultModal(self.table)
-        await interaction.response.send_modal(modal)
+        await interaction.followup.send_modal(modal)
 
 
 # ==========================
@@ -271,12 +346,16 @@ class EndTournamentView(discord.ui.View):
             await interaction.response.send_message("❌ 大会作成者だけが終了できます。", ephemeral=True)
             return
 
+        await interaction.response.defer()
         await end_tournament_internal(interaction)
 
         for item in self.children:
             item.disabled = True
 
-        await interaction.message.edit(view=self)
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
 
 
 # ==========================
@@ -289,6 +368,7 @@ class JoinLeaveStartView(discord.ui.View):
 
     @discord.ui.button(label="参加する", style=discord.ButtonStyle.green)
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(f"[Button] join_button clicked by {interaction.user.id}")
         t = tournament_data.current_tournament
         if t is None:
             await interaction.response.send_message("❌ 大会がありません。", ephemeral=True)
@@ -305,6 +385,16 @@ class JoinLeaveStartView(discord.ui.View):
 
         player = tournament_data.create_player(user)
         t["participants"].append(player)
+        print(f"[Button] participant added: user_id={user.id} name={user.display_name}")
+
+        try:
+            print(f"[DM] sending join confirmation to user_id={user.id} name={user.display_name}")
+            await user.send(f"【{t['name']}】に参加登録しました。大会開始後にラウンドごとの対戦相手をDMでお送りします。")
+            print(f"[DM] join confirmation sent to user_id={user.id}")
+        except discord.Forbidden as exc:
+            print(f"[DM] join confirmation forbidden for user_id={user.id}: {exc}")
+        except Exception as exc:
+            print(f"[DM] join confirmation failed for user_id={user.id}: {exc}")
 
         embed = discord.Embed(
             title="🏆 大会を作成しました",
@@ -353,20 +443,21 @@ class JoinLeaveStartView(discord.ui.View):
 
     @discord.ui.button(label="大会開始", style=discord.ButtonStyle.blurple)
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(f"[Button] start_button clicked by {interaction.user.id}")
+        await interaction.response.defer()
         t = tournament_data.current_tournament
         if t is None:
-            await interaction.response.send_message("❌ 大会がありません。", ephemeral=True)
+            await safe_interaction_send(interaction, content="❌ 大会がありません。")
             return
 
         if interaction.user.id != self.creator_id:
-            await interaction.response.send_message("❌ この大会の作成者だけが開始できます。", ephemeral=True)
+            await safe_interaction_send(interaction, content="❌ この大会の作成者だけが開始できます。")
             return
 
         if t["started"]:
-            await interaction.response.send_message("⚠️ すでに開始されています。", ephemeral=True)
+            await safe_interaction_send(interaction, content="⚠️ すでに開始されています。")
             return
 
-        await interaction.response.defer()
         await start_tournament_internal(interaction)
 
 
@@ -377,14 +468,21 @@ class Tournament(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="大会作成", description="新しい大会を作成します")
     @app_commands.describe(bo="BO1 または BO3 を選択")
     async def create_tournament(self, interaction: discord.Interaction, name: str, bo: str):
-
         if bo not in ["BO1", "BO3"]:
             await interaction.response.send_message("❌ BO は BO1 または BO3 を指定してください。", ephemeral=True)
             return
+
+        await safe_defer_interaction(interaction)
+
+        previous_tournament = tournament_data.current_tournament
+        previous_message_id = None
+        previous_channel_id = None
+        if isinstance(previous_tournament, dict):
+            previous_message_id = previous_tournament.get("message_id")
+            previous_channel_id = previous_tournament.get("channel_id")
 
         tournament_data.current_tournament = {
             "name": name,
@@ -393,7 +491,9 @@ class Tournament(commands.Cog):
             "round": 0,
             "matches": [],
             "creator_id": interaction.user.id,
-            "bo": bo
+            "bo": bo,
+            "message_id": previous_message_id,
+            "channel_id": previous_channel_id
         }
 
         embed = discord.Embed(
@@ -407,7 +507,7 @@ class Tournament(commands.Cog):
         embed.add_field(name="形式", value=bo, inline=True)
 
         view = JoinLeaveStartView(interaction.user.id)
-        await interaction.response.send_message(embed=embed, view=view)
+        await upsert_tournament_message(interaction, tournament_data.current_tournament, embed, view)
 
 
 async def setup(bot: commands.Bot):
