@@ -170,7 +170,7 @@ async def process_result_modal(interaction: discord.Interaction, table: int, p1_
         )
 
     await interaction.response.send_message(embed=embed)
-
+    await auto_next_round(interaction)
 
 class Match(commands.Cog):
     def __init__(self, bot):
